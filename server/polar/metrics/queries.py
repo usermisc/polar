@@ -10,6 +10,7 @@ from sqlalchemy import (
     Select,
     SQLColumnExpression,
     and_,
+    column,
     cte,
     func,
     or_,
@@ -44,6 +45,9 @@ class MetricQuery(StrEnum):
     canceled_subscriptions = "canceled_subscriptions"
     costs = "costs"
     cumulative_costs = "cumulative_costs"
+    events = "events"
+    events_per_customer = "events_per_customer"
+    customer_lifetime = "customer_lifetime"
 
 
 def _get_metrics_columns(
@@ -560,6 +564,209 @@ def get_cumulative_cost_events_cte(
     )
 
 
+def _get_readable_events_statement(
+    auth_subject: AuthSubject[User | Organization],
+    *,
+    organization_id: Sequence[uuid.UUID] | None = None,
+    customer_id: Sequence[uuid.UUID] | None = None,
+) -> Select[tuple[uuid.UUID]]:
+    statement = select(Event.id)
+
+    if is_user(auth_subject):
+        statement = statement.where(
+            Event.organization_id.in_(
+                select(UserOrganization.organization_id).where(
+                    UserOrganization.user_id == auth_subject.subject.id,
+                    UserOrganization.deleted_at.is_(None),
+                )
+            )
+        )
+    elif is_organization(auth_subject):
+        statement = statement.where(Event.organization_id == auth_subject.subject.id)
+
+    if organization_id is not None:
+        statement = statement.where(Event.organization_id.in_(organization_id))
+
+    if customer_id is not None:
+        statement = statement.join(
+            Customer,
+            onclause=Event.customer_id == Customer.id,
+        ).where(Customer.id.in_(customer_id))
+
+    return statement
+
+
+def get_events_cte(
+    timestamp_series: CTE,
+    interval: TimeInterval,
+    auth_subject: AuthSubject[User | Organization],
+    metrics: list["type[Metric]"],
+    now: datetime,
+    *,
+    organization_id: Sequence[uuid.UUID] | None = None,
+    customer_id: Sequence[uuid.UUID] | None = None,
+    product_id: Sequence[uuid.UUID] | None = None,
+    billing_type: Sequence[ProductBillingType] | None = None,
+) -> CTE:
+    timestamp_column: ColumnElement[datetime] = timestamp_series.c.timestamp
+
+    readable_events_statement = _get_readable_events_statement(
+        auth_subject,
+        organization_id=organization_id,
+        customer_id=customer_id,
+    )
+
+    return cte(
+        select(
+            timestamp_column.label("timestamp"),
+            *_get_metrics_columns(
+                MetricQuery.events, timestamp_column, interval, metrics, now
+            ),
+        )
+        .select_from(
+            timestamp_series.join(
+                Event,
+                isouter=True,
+                onclause=and_(
+                    interval.sql_date_trunc(Event.timestamp)
+                    == interval.sql_date_trunc(timestamp_column),
+                    Event.id.in_(readable_events_statement),
+                ),
+            )
+        )
+        .group_by(timestamp_column)
+        .order_by(timestamp_column.asc())
+    )
+
+
+def get_events_per_customer_cte(
+    timestamp_series: CTE,
+    interval: TimeInterval,
+    auth_subject: AuthSubject[User | Organization],
+    metrics: list["type[Metric]"],
+    now: datetime,
+    *,
+    organization_id: Sequence[uuid.UUID] | None = None,
+    customer_id: Sequence[uuid.UUID] | None = None,
+    product_id: Sequence[uuid.UUID] | None = None,
+    billing_type: Sequence[ProductBillingType] | None = None,
+) -> CTE:
+    timestamp_column: ColumnElement[datetime] = timestamp_series.c.timestamp
+
+    readable_events_statement = _get_readable_events_statement(
+        auth_subject,
+        organization_id=organization_id,
+        customer_id=customer_id,
+    )
+
+    return cte(
+        select(
+            timestamp_column.label("timestamp"),
+            *_get_metrics_columns(
+                MetricQuery.events_per_customer,
+                timestamp_column,
+                interval,
+                metrics,
+                now,
+            ),
+        )
+        .select_from(
+            timestamp_series.join(
+                Event,
+                isouter=True,
+                onclause=and_(
+                    interval.sql_date_trunc(Event.timestamp)
+                    == interval.sql_date_trunc(timestamp_column),
+                    Event.id.in_(readable_events_statement),
+                ),
+            )
+        )
+        .group_by(timestamp_column, column("customer_id"))
+        .order_by(timestamp_column.asc())
+    )
+
+
+def get_customer_lifetime_cte(
+    timestamp_series: CTE,
+    interval: TimeInterval,
+    auth_subject: AuthSubject[User | Organization],
+    metrics: list["type[Metric]"],
+    now: datetime,
+    *,
+    organization_id: Sequence[uuid.UUID] | None = None,
+    customer_id: Sequence[uuid.UUID] | None = None,
+    product_id: Sequence[uuid.UUID] | None = None,
+    billing_type: Sequence[ProductBillingType] | None = None,
+) -> CTE:
+    timestamp_column: ColumnElement[datetime] = timestamp_series.c.timestamp
+
+    readable_events_statement = _get_readable_events_statement(
+        auth_subject,
+        organization_id=organization_id,
+        customer_id=customer_id,
+    )
+
+    first_revenue = (
+        select(
+            Event.customer_id,
+            func.min(Event.timestamp).label("first_revenue_at"),
+        )
+        .where(
+            Event.name == "order.paid",
+            Event.id.in_(readable_events_statement),
+        )
+        .group_by(Event.customer_id)
+    ).cte("first_revenue")
+
+    acquisition_costs = (
+        select(
+            Event.customer_id,
+            first_revenue.c.first_revenue_at,
+            func.sum(Event.user_metadata["_cost"]["amount"].as_numeric(17, 12)).label(
+                "acquisition_cost"
+            ),
+        )
+        .join(first_revenue, Event.customer_id == first_revenue.c.customer_id)
+        .where(
+            Event.timestamp < first_revenue.c.first_revenue_at,
+            Event.user_metadata["_cost"].is_not(None),
+            Event.id.in_(readable_events_statement),
+        )
+        .group_by(Event.customer_id, first_revenue.c.first_revenue_at)
+    ).cte("acquisition_costs")
+
+    return cte(
+        select(
+            timestamp_column.label("timestamp"),
+            acquisition_costs.c.customer_id,
+            acquisition_costs.c.first_revenue_at,
+            acquisition_costs.c.acquisition_cost,
+            *_get_metrics_columns(
+                MetricQuery.customer_lifetime,
+                timestamp_column,
+                interval,
+                metrics,
+                now,
+            ),
+        )
+        .select_from(
+            timestamp_series.join(
+                acquisition_costs,
+                isouter=True,
+                onclause=interval.sql_date_trunc(acquisition_costs.c.first_revenue_at)
+                == interval.sql_date_trunc(timestamp_column),
+            )
+        )
+        .group_by(
+            timestamp_column,
+            acquisition_costs.c.customer_id,
+            acquisition_costs.c.first_revenue_at,
+            acquisition_costs.c.acquisition_cost,
+        )
+        .order_by(timestamp_column.asc())
+    )
+
+
 QUERIES: list[QueryCallable] = [
     get_orders_cte,
     get_cumulative_orders_cte,
@@ -568,4 +775,7 @@ QUERIES: list[QueryCallable] = [
     get_canceled_subscriptions_cte,
     get_cost_events_cte,
     get_cumulative_cost_events_cte,
+    get_events_cte,
+    get_events_per_customer_cte,
+    get_customer_lifetime_cte,
 ]

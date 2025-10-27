@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     SQLColumnExpression,
     case,
+    column,
     func,
     or_,
     type_coerce,
@@ -755,6 +756,142 @@ class CumulativeCostsMetric(Metric):
         return cumulative_last(periods, cls.slug)
 
 
+class AverageRevenuePerUserMetric(Metric):
+    slug = "average_revenue_per_user"
+    display_name = "Average Revenue Per User (ARPU)"
+    type = MetricType.currency
+    query = MetricQuery.active_subscriptions
+
+    @classmethod
+    def get_sql_expression(
+        cls, t: ColumnElement[datetime], i: TimeInterval, now: datetime
+    ) -> ColumnElement[int]:
+        return func.cast(
+            case(
+                (func.count(Subscription.customer_id.distinct()) == 0, 0),
+                else_=func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                Subscription.recurring_interval
+                                == SubscriptionRecurringInterval.year,
+                                func.round(Subscription.amount / 12),
+                            ),
+                            (
+                                Subscription.recurring_interval
+                                == SubscriptionRecurringInterval.month,
+                                Subscription.amount,
+                            ),
+                            (
+                                Subscription.recurring_interval
+                                == SubscriptionRecurringInterval.week,
+                                func.round(Subscription.amount * 4),
+                            ),
+                            (
+                                Subscription.recurring_interval
+                                == SubscriptionRecurringInterval.day,
+                                func.round(Subscription.amount * 30),
+                            ),
+                        )
+                    ),
+                    0,
+                )
+                / func.count(Subscription.customer_id.distinct()),
+            ),
+            Integer,
+        )
+
+    @classmethod
+    def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> int | float:
+        return cumulative_last(periods, cls.slug)
+
+
+class CostPerUserMetric(Metric):
+    slug = "cost_per_user"
+    display_name = "Cost Per User"
+    type = MetricType.currency
+    query = MetricQuery.events_per_customer
+
+    @classmethod
+    def get_sql_expression(
+        cls, t: ColumnElement[datetime], i: TimeInterval, now: datetime
+    ) -> ColumnElement[float]:
+        total_customers = func.count(func.distinct(Event.customer_id))
+
+        total_costs = func.sum(
+            func.coalesce(Event.user_metadata["_cost"]["amount"].as_numeric(17, 12), 0)
+        )
+
+        return type_coerce(
+            case(
+                (total_customers == 0, 0),
+                else_=total_costs / total_customers,
+            ),
+            Float,
+        )
+
+    @classmethod
+    def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> float:
+        return cumulative_last(periods, cls.slug)
+
+
+class GrossMarginMetric(Metric):
+    slug = "gross_margin"
+    display_name = "Gross Margin"
+    type = MetricType.currency
+    query = MetricQuery.events
+
+    @classmethod
+    def get_sql_expression(
+        cls, t: ColumnElement[datetime], i: TimeInterval, now: datetime
+    ) -> ColumnElement[float]:
+        revenue = func.sum(
+            case(
+                (
+                    Event.name == "order.paid",
+                    Event.user_metadata["amount"].as_integer(),
+                ),
+                else_=0,
+            )
+        )
+
+        costs = func.sum(
+            func.coalesce(Event.user_metadata["_cost"]["amount"].as_numeric(17, 12), 0)
+        )
+
+        return revenue - costs
+
+    @classmethod
+    def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> float:
+        return cumulative_sum(periods, cls.slug)
+
+
+class CustomerAcquisitionCostMetric(Metric):
+    slug = "customer_acquisition_cost"
+    display_name = "Customer Acquisition Cost (CAC)"
+    type = MetricType.currency
+    query = MetricQuery.customer_lifetime
+
+    @classmethod
+    def get_sql_expression(
+        cls, t: ColumnElement[datetime], i: TimeInterval, now: datetime
+    ) -> ColumnElement[float]:
+        customers_acquired = func.count(func.distinct(column("customer_id")))
+        total_acquisition_costs = func.sum(func.coalesce(column("acquisition_cost"), 0))
+
+        return type_coerce(
+            case(
+                (customers_acquired == 0, 0),
+                else_=total_acquisition_costs / customers_acquired,
+            ),
+            Float,
+        )
+
+    @classmethod
+    def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> float:
+        return cumulative_last(periods, cls.slug)
+
+
 METRICS: list[type[Metric]] = [
     OrdersMetric,
     RevenueMetric,
@@ -765,6 +902,10 @@ METRICS: list[type[Metric]] = [
     CumulativeCostsMetric,
     AverageOrderValueMetric,
     NetAverageOrderValueMetric,
+    AverageRevenuePerUserMetric,
+    CostPerUserMetric,
+    GrossMarginMetric,
+    CustomerAcquisitionCostMetric,
     OneTimeProductsMetric,
     OneTimeProductsRevenueMetric,
     OneTimeProductsNetRevenueMetric,
