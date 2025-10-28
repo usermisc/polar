@@ -815,7 +815,7 @@ class CostPerUserMetric(Metric):
     slug = "cost_per_user"
     display_name = "Cost Per User"
     type = MetricType.currency
-    query = MetricQuery.events_per_customer
+    query = MetricQuery.events
 
     @classmethod
     def get_sql_expression(
@@ -837,7 +837,7 @@ class CostPerUserMetric(Metric):
 
     @classmethod
     def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> float:
-        return cumulative_last(periods, cls.slug)
+        return cumulative_sum(periods, cls.slug) / len(periods)
 
 
 class GrossMarginMetric(Metric):
@@ -869,6 +869,22 @@ class GrossMarginMetric(Metric):
     @classmethod
     def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> float:
         return cumulative_sum(periods, cls.slug)
+
+
+class GrossMarginPercentageMetric(MetaMetric):
+    slug = "gross_margin_percentage"
+    display_name = "Gross Margin %"
+    type = MetricType.percentage
+
+    @classmethod
+    def compute_from_period(cls, period: "MetricsPeriod") -> float:
+        gross_margin = period.gross_margin
+        mrr = period.monthly_recurring_revenue
+        return gross_margin / mrr if mrr > 0 else 0.0
+
+    @classmethod
+    def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> float:
+        return cumulative_sum(periods, cls.slug) / len(periods)
 
 
 class CustomerAcquisitionCostMetric(Metric):
