@@ -996,7 +996,7 @@ METRICS_SQL: list[type[Metric]] = [
     AverageRevenuePerUserMetric,
     CostPerUserMetric,
     GrossMarginMetric,
-    CustomerAcquisitionCostMetric,
+    # CustomerAcquisitionCostMetric,
     OneTimeProductsMetric,
     OneTimeProductsRevenueMetric,
     OneTimeProductsNetRevenueMetric,
@@ -1024,10 +1024,11 @@ METRICS_SQL: list[type[Metric]] = [
 ]
 
 METRICS_POST_COMPUTE: list[type[Metric]] = [
-    ChurnRateMetric,
-    CacPaybackPeriodMetric,
-    CustomerLifetimeValueMetric,
-    LtvToCacRatioMetric,
+    GrossMarginPercentageMetric,
+    # ChurnRateMetric,
+    # CacPaybackPeriodMetric,
+    # CustomerLifetimeValueMetric,
+    # LtvToCacRatioMetric,
 ]
 
 METRICS: list[type[Metric]] = [

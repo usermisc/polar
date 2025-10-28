@@ -777,5 +777,5 @@ QUERIES: list[QueryCallable] = [
     get_cumulative_cost_events_cte,
     get_events_cte,
     get_events_per_customer_cte,
-    get_customer_lifetime_cte,
+    # get_customer_lifetime_cte,
 ]
