@@ -81,17 +81,35 @@ class MetricsService:
             statement,
             execution_options={"yield_per": settings.DATABASE_STREAM_YIELD_PER},
         )
-        periods: list[MetricsPeriod] = []
+        periods_by_timestamp: dict[datetime, list[dict]] = {}
         async for row in result:
             period_dict = row._asdict()
 
-            temp_period = MetricsPeriod(**period_dict)
             for meta_metric in METRICS_POST_COMPUTE:
-                period_dict[meta_metric.slug] = meta_metric.compute_from_period(
-                    temp_period
-                )
+                period_dict[meta_metric.slug] = 0
 
-            periods.append(MetricsPeriod(**period_dict))
+            period = MetricsPeriod(**period_dict)
+
+            for meta_metric in METRICS_POST_COMPUTE:
+                period_dict[meta_metric.slug] = meta_metric.compute_from_period(period)
+
+            timestamp = period_dict["timestamp"]
+            if timestamp not in periods_by_timestamp:
+                periods_by_timestamp[timestamp] = []
+            periods_by_timestamp[timestamp].append(period_dict)
+
+        periods: list[MetricsPeriod] = []
+        for timestamp in sorted(periods_by_timestamp.keys()):
+            group = periods_by_timestamp[timestamp]
+
+            if len(group) == 1:
+                periods.append(MetricsPeriod(**group[0]))
+            else:
+                aggregated = group[0].copy()
+                for key, value in aggregated.items():
+                    if isinstance(value, (int, float)) and key != "timestamp":
+                        aggregated[key] = sum(p[key] for p in group) / len(group)
+                periods.append(MetricsPeriod(**aggregated))
 
         totals: dict[str, int | float] = {}
         for metric in METRICS:
