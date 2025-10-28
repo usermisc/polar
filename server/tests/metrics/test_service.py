@@ -4,6 +4,7 @@ from typing import NotRequired, TypedDict
 import pytest
 import pytest_asyncio
 from apscheduler.util import ZoneInfo
+from sqlalchemy import select
 
 from polar.auth.models import AuthSubject
 from polar.enums import SubscriptionRecurringInterval
@@ -235,10 +236,10 @@ class TestGetMetrics:
             (TimeInterval.month, 12),
             (
                 TimeInterval.week,
-                53,  # Last week of the year (Monday 30th) is partial, so +1
+                53,
             ),
-            (TimeInterval.day, 366),  # Leap year!
-            (TimeInterval.hour, 8784),  # Leap year!
+            (TimeInterval.day, 366),
+            (TimeInterval.hour, 8784),
         ],
     )
     async def test_intervals(
@@ -1354,7 +1355,6 @@ class TestGetMetrics:
         customer_second: Customer,
         organization: Organization,
     ) -> None:
-        # Customer 1: $50 cost in Dec, first revenue (order.paid) in Jan
         await create_event(
             save_fixture,
             timestamp=datetime(2023, 12, 15, 12, 0, tzinfo=UTC),
@@ -1381,7 +1381,6 @@ class TestGetMetrics:
             },
         )
 
-        # Customer 2: $30 cost in Jan, $20 cost in Feb, first revenue in Feb
         await create_event(
             save_fixture,
             timestamp=datetime(2024, 1, 10, 12, 0, tzinfo=UTC),
@@ -1439,3 +1438,256 @@ class TestGetMetrics:
         assert feb.customer_acquisition_cost == 50.00
         mar = metrics.periods[2]
         assert mar.customer_acquisition_cost == 0
+
+    @pytest.mark.auth
+    async def test_churn_rate(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        auth_subject: AuthSubject[User],
+        user_organization: UserOrganization,
+        customer: Customer,
+        organization: Organization,
+    ) -> None:
+        subscriptions: dict[str, SubscriptionFixture] = {
+            "subscription_1": {
+                "started_at": date(2024, 1, 1),
+                "product": "monthly_subscription",
+            },
+            "subscription_2": {
+                "started_at": date(2024, 1, 1),
+                "product": "monthly_subscription",
+            },
+        }
+        await _create_fixtures(
+            save_fixture, customer, organization, PRODUCTS, subscriptions, {}
+        )
+
+        subscription_1 = (
+            await session.execute(
+                select(Subscription)
+                .where(
+                    Subscription.customer_id == customer.id,
+                    Subscription.started_at == _date_to_datetime(date(2024, 1, 1)),
+                )
+                .limit(1)
+            )
+        ).scalar_one()
+        subscription_1.canceled_at = _date_to_datetime(date(2024, 2, 15))
+        await session.commit()
+
+        metrics = await metrics_service.get_metrics(
+            session,
+            auth_subject,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 3, 1),
+            timezone=ZoneInfo("UTC"),
+            interval=TimeInterval.month,
+        )
+
+        assert len(metrics.periods) == 3
+
+        jan = metrics.periods[0]
+        assert jan.active_subscriptions == 2
+        assert jan.canceled_subscriptions == 0
+        assert jan.churn_rate == 0.0
+
+        feb = metrics.periods[1]
+        assert feb.active_subscriptions == 2
+        assert feb.canceled_subscriptions == 1
+        assert feb.churn_rate == 0.5
+
+        mar = metrics.periods[2]
+        assert mar.active_subscriptions == 1
+        assert mar.canceled_subscriptions == 0
+        assert mar.churn_rate == 0.0
+
+    @pytest.mark.auth
+    async def test_meta_metrics(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        auth_subject: AuthSubject[User],
+        user_organization: UserOrganization,
+        customer: Customer,
+        customer_second: Customer,
+        organization: Organization,
+    ) -> None:
+        await create_event(
+            save_fixture,
+            timestamp=datetime(2023, 12, 15, 12, 0, tzinfo=UTC),
+            organization=organization,
+            customer=customer,
+            name="user.event",
+            metadata={
+                "_cost": {
+                    "amount": 50.00,
+                    "currency": "usd",
+                }
+            },
+        )
+
+        await create_event(
+            save_fixture,
+            timestamp=datetime(2024, 1, 5, 12, 0, tzinfo=UTC),
+            organization=organization,
+            customer=customer,
+            name="order.paid",
+            source=EventSource.system,
+            metadata={
+                "amount": 10000,
+            },
+        )
+
+        subscriptions_customer_1: dict[str, SubscriptionFixture] = {
+            "subscription_1": {
+                "started_at": date(2024, 1, 1),
+                "product": "monthly_subscription",
+            }
+        }
+        orders_customer_1: dict[str, OrderFixture] = {
+            "order_1": {
+                "created_at": date(2024, 1, 5),
+                "product": "monthly_subscription",
+                "subscription": "subscription_1",
+                "amount": 10000,
+                "status": OrderStatus.paid,
+            }
+        }
+        await _create_fixtures(
+            save_fixture,
+            customer,
+            organization,
+            PRODUCTS,
+            subscriptions_customer_1,
+            orders_customer_1,
+        )
+
+        await create_event(
+            save_fixture,
+            timestamp=datetime(2023, 12, 20, 12, 0, tzinfo=UTC),
+            organization=organization,
+            customer=customer_second,
+            name="user.event",
+            metadata={
+                "_cost": {
+                    "amount": 30.00,
+                    "currency": "usd",
+                }
+            },
+        )
+
+        await create_event(
+            save_fixture,
+            timestamp=datetime(2024, 1, 10, 12, 0, tzinfo=UTC),
+            organization=organization,
+            customer=customer_second,
+            name="order.paid",
+            source=EventSource.system,
+            metadata={
+                "amount": 10000,
+            },
+        )
+
+        subscriptions_customer_2: dict[str, SubscriptionFixture] = {
+            "subscription_2": {
+                "started_at": date(2024, 1, 1),
+                "product": "monthly_subscription",
+            }
+        }
+        orders_customer_2: dict[str, OrderFixture] = {
+            "order_2": {
+                "created_at": date(2024, 1, 10),
+                "product": "monthly_subscription",
+                "subscription": "subscription_2",
+                "amount": 10000,
+                "status": OrderStatus.paid,
+            }
+        }
+        await _create_fixtures(
+            save_fixture,
+            customer_second,
+            organization,
+            PRODUCTS,
+            subscriptions_customer_2,
+            orders_customer_2,
+        )
+
+        await create_event(
+            save_fixture,
+            timestamp=datetime(2024, 1, 15, 12, 0, tzinfo=UTC),
+            organization=organization,
+            customer=customer,
+            metadata={
+                "_cost": {
+                    "amount": 25.00,
+                    "currency": "usd",
+                }
+            },
+        )
+
+        await create_event(
+            save_fixture,
+            timestamp=datetime(2024, 1, 16, 12, 0, tzinfo=UTC),
+            organization=organization,
+            customer=customer_second,
+            metadata={
+                "_cost": {
+                    "amount": 15.00,
+                    "currency": "usd",
+                }
+            },
+        )
+
+        subscription_2 = (
+            await session.execute(
+                select(Subscription)
+                .where(
+                    Subscription.customer_id == customer_second.id,
+                )
+                .limit(1)
+            )
+        ).scalar_one()
+        subscription_2.canceled_at = _date_to_datetime(date(2024, 2, 15))
+        await session.commit()
+
+        metrics = await metrics_service.get_metrics(
+            session,
+            auth_subject,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 2, 29),
+            timezone=ZoneInfo("UTC"),
+            interval=TimeInterval.month,
+        )
+
+        assert len(metrics.periods) == 2
+
+        jan = metrics.periods[0]
+
+        assert jan.customer_acquisition_cost == 40.00
+        assert jan.average_revenue_per_user == 10000
+        assert jan.revenue == 20000
+        assert jan.costs == 40.00
+        assert jan.gross_margin == 20000 - 40.00
+        assert jan.active_subscriptions == 2
+        assert jan.canceled_subscriptions == 0
+
+        assert jan.churn_rate == 0.0
+        assert jan.cac_payback_period == 40.00 / 10000
+        assert jan.customer_lifetime_value == 0.0
+        assert jan.ltv_to_cac_ratio == 0.0
+
+        feb = metrics.periods[1]
+
+        assert feb.customer_acquisition_cost == 0
+        assert feb.average_revenue_per_user == 10000
+        assert feb.revenue == 0
+        assert feb.costs == 0
+        assert feb.gross_margin == 0
+        assert feb.active_subscriptions == 2
+        assert feb.canceled_subscriptions == 1
+
+        assert feb.churn_rate == 0.5
+        assert feb.cac_payback_period == 0.0
+        assert feb.customer_lifetime_value == 0.0
+        assert feb.ltv_to_cac_ratio == 0.0

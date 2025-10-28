@@ -59,6 +59,11 @@ class Metric(Protocol):
     def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> int | float: ...
 
 
+class MetaMetric(Metric, Protocol):
+    @classmethod
+    def compute_from_period(cls, period: "MetricsPeriod") -> int | float: ...
+
+
 class OrdersMetric(Metric):
     slug = "orders"
     display_name = "Orders"
@@ -892,7 +897,77 @@ class CustomerAcquisitionCostMetric(Metric):
         return cumulative_last(periods, cls.slug)
 
 
-METRICS: list[type[Metric]] = [
+class ChurnRateMetric(MetaMetric):
+    slug = "churn_rate"
+    display_name = "Churn Rate"
+    type = MetricType.percentage
+
+    @classmethod
+    def compute_from_period(cls, period: "MetricsPeriod") -> float:
+        active = period.active_subscriptions
+        canceled = period.canceled_subscriptions
+        return canceled / active if active > 0 else 0.0
+
+    @classmethod
+    def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> float:
+        return cumulative_last(periods, cls.slug)
+
+
+class CacPaybackPeriodMetric(MetaMetric):
+    slug = "cac_payback_period"
+    display_name = "CAC Payback Period (months)"
+    type = MetricType.scalar
+
+    @classmethod
+    def compute_from_period(cls, period: "MetricsPeriod") -> float:
+        cac = period.customer_acquisition_cost
+        arpu = period.average_revenue_per_user
+        return cac / arpu if arpu > 0 else 0.0
+
+    @classmethod
+    def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> float:
+        return cumulative_last(periods, cls.slug)
+
+
+class CustomerLifetimeValueMetric(MetaMetric):
+    slug = "customer_lifetime_value"
+    display_name = "Customer Lifetime Value (CLV)"
+    type = MetricType.currency
+
+    @classmethod
+    def compute_from_period(cls, period: "MetricsPeriod") -> float:
+        arpu = period.average_revenue_per_user
+        revenue = period.revenue
+        gross_margin = period.gross_margin
+        churn_rate = period.churn_rate
+
+        gross_margin_pct = gross_margin / revenue if revenue > 0 else 0.0
+
+        return (arpu * gross_margin_pct) / churn_rate if churn_rate > 0 else 0.0
+
+    @classmethod
+    def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> float:
+        return cumulative_last(periods, cls.slug)
+
+
+class LtvToCacRatioMetric(MetaMetric):
+    slug = "ltv_to_cac_ratio"
+    display_name = "LTV:CAC Ratio"
+    type = MetricType.scalar
+
+    @classmethod
+    def compute_from_period(cls, period: MetricsPeriod) -> float:
+        ltv = period.customer_lifetime_value
+        cac = period.customer_acquisition_cost
+
+        return ltv / cac if cac > 0 else 0.0
+
+    @classmethod
+    def get_cumulative(cls, periods: Iterable["MetricsPeriod"]) -> float:
+        return cumulative_last(periods, cls.slug)
+
+
+METRICS_SQL: list[type[Metric]] = [
     OrdersMetric,
     RevenueMetric,
     NetRevenueMetric,
@@ -932,4 +1007,23 @@ METRICS: list[type[Metric]] = [
     CanceledSubscriptionsOtherMetric,
 ]
 
-__all__ = ["MetricType", "Metric", "METRICS"]
+METRICS_POST_COMPUTE: list[type[Metric]] = [
+    ChurnRateMetric,
+    CacPaybackPeriodMetric,
+    CustomerLifetimeValueMetric,
+    LtvToCacRatioMetric,
+]
+
+METRICS: list[type[Metric]] = [
+    *METRICS_SQL,
+    *METRICS_POST_COMPUTE,
+]
+
+__all__ = [
+    "MetricType",
+    "Metric",
+    "MetaMetric",
+    "METRICS_SQL",
+    "METRICS_POST_COMPUTE",
+    "METRICS",
+]
